@@ -1,0 +1,4 @@
+[flake8]
+ignore = E501,F401,F841
+exclude = env,venv,migrations
+show-source = true

@@ -1,0 +1,7 @@
+Django<=1.12
+django-cors-headers
+djangorestframework
+PyJWT
+PyMySQL
+pyotp
+requests
