@@ -12,7 +12,7 @@ class UserSimpleSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = models.User
-        fields = ('id', 'uid', 'mobile', 'wx_openid')
+        fields = ('id', 'uid', 'mobile','nickname',"email", 'username','wx_openid')
 
     def get_uid(self, obj):
         return obj.pk
@@ -25,6 +25,19 @@ class UserLoginSerializer(serializers.Serializer):
     password = serializers.CharField(
         max_length=64, error_messages={'required': u'密码不能为空'})
     uid = serializers.IntegerField(default=0)
+
+    def validate_username(self, value):
+        """检查登录名
+
+        :param value:
+        """
+        # 若登录名为邮箱, 则没有确认之前不允许登录
+        if helpers.is_email(value):
+            user = models.User.objects.filter(email=value).first()
+            if user and not user.email_confirmed:
+                raise serializers.ValidationError(u'email 地址未确认')
+
+        return value
 
     def validate_password(self, value):
         """检查密码
@@ -218,13 +231,16 @@ class UserBindWeixinSerializer(serializers.Serializer):
             raise serializers.ValidationError(u'微信 ID 类型与系统设置不匹配.')
         return value
 
+    def validate(self, data):
+        if models.UserWeixin.is_exists(data['sort'], data['weixin_id']):
+            raise serializers.ValidationError({'weixin_id': u'微信 OpenID 或 UnionID 已绑定.'})
+        return data
+
 
 class SendSMSCodeSerializer(serializers.Serializer):
     """短信序列化器"""
     mobile = serializers.CharField(
-        max_length=32, error_messages={'required': u'手机号码不能为空'})
-    token = serializers.CharField(
-        max_length=64, error_messages={'required': u'Token 不能为空'})
+        max_length=128, error_messages={'required': u'该字段不能为空'})
     #: 使用场景
     context = serializers.ChoiceField(choices=models.SMSCode.CONTEXTS, required=True)
 
@@ -233,29 +249,25 @@ class SendSMSCodeSerializer(serializers.Serializer):
 
         :param value:
         """
-        from .helpers import is_mobile
-        if not is_mobile(value):
-            raise serializers.ValidationError(u'手机号码不符合要求')
-        return value
+        from . import helpers
 
-    def validate_token(self, value):
-        """检查 token
+        value = value.lower()
 
-        :param value:
-        """
-        if value != getattr(settings, 'SMS_AUTH_TOKEN'):
-            raise serializers.ValidationError(u'Token 验证失败')
+        if not helpers.is_mobile(value) and not helpers.is_email(value):
+            raise serializers.ValidationError(u'该字段格式不符合要求')
         return value
 
     def validate(self, data):
         context = data.get('context', models.SMSCode.CONTEXT_REGISTER)
-        user = models.User.objects.filter(mobile=data.get('mobile')).first()
+        mobile = data.get('mobile')
+        qc = models.models.Q(mobile=mobile) | models.models.Q(email=mobile)
+        user = models.User.objects.filter(qc).first()
         if context == models.SMSCode.CONTEXT_REGISTER:
             if user:
-                raise serializers.ValidationError({'mobile': u'手机号码已注册'})
+                raise serializers.ValidationError({'mobile': u'该账号已注册'})
         else:
             if not user:
-                raise serializers.ValidationError({'mobile': u'手机号码未注册'})
+                raise serializers.ValidationError({'mobile': u'该账号未注册'})
         return data
 
 
@@ -264,7 +276,7 @@ class CheckSMSCodeSerializer(serializers.Serializer):
 
     #: 手机号
     mobile = serializers.CharField(
-        max_length=32, error_messages={'required': u'手机号码不能为空'})
+        max_length=128, error_messages={'required': u'该字段不能为空'})
 
     #: 验证码
     code = serializers.CharField(
@@ -278,9 +290,13 @@ class CheckSMSCodeSerializer(serializers.Serializer):
 
         :param value:
         """
-        from .helpers import is_mobile
-        if not is_mobile(value):
-            raise serializers.ValidationError(u'手机号码不符合要求')
+        from . import helpers
+
+        value = value.lower()
+
+        if not helpers.is_mobile(value) and not helpers.is_email(value):
+            raise serializers.ValidationError(u'该字段格式不符合要求')
+
         return value
 
 
@@ -304,11 +320,22 @@ class WeixinConfigSerializer(serializers.Serializer):
 
     url = serializers.URLField(max_length=256, error_messages={'required': u'url 不能为空'})
 
+class UserInfoSerializer(serializers.Serializer):
+    """用户信息"""
+    fullname = serializers.CharField(
+        max_length=128, error_messages={'required': u'姓名不能空'})
+    #: 头像
+    avatar = serializers.CharField(max_length=128, required=False)
+    email = serializers.CharField(max_length=128, required=False)
+
+
 
 class UserRegisterByMobileSerializer(serializers.Serializer):
     """用户注册序列化器"""
+    nickname = serializers.CharField(
+        max_length=128, error_messages={'required': u'请输入昵称'})
     mobile = serializers.CharField(
-        max_length=16, error_messages={'required': u'手机不能为空'})
+        max_length=128, error_messages={'required': u'该字段不能为空'})
     password = serializers.CharField(
         max_length=64, error_messages={'required': u'密码不能为空'})
     code = serializers.CharField(
@@ -319,11 +346,15 @@ class UserRegisterByMobileSerializer(serializers.Serializer):
 
         :param value:
         """
-        from .helpers import is_mobile
-        if not is_mobile(value):
-            raise serializers.ValidationError(u'手机号码不符合要求')
-        if models.User.check_mobile_existed(value):
-            raise serializers.ValidationError(u'手机号码已经注册过')
+        from . import helpers
+
+        value = value.lower()
+
+        if not helpers.is_mobile(value) and not helpers.is_email(value):
+            raise serializers.ValidationError(u'该字段格式不符合要求')
+        if models.User.check_mobile_existed(value) or \
+                models.User.check_email_existed(value):
+            raise serializers.ValidationError(u'该账号已经注册')
         return value
 
     def validate_password(self, value):
@@ -337,6 +368,9 @@ class UserRegisterByMobileSerializer(serializers.Serializer):
 
     def validate(self, data):
         mobile = data['mobile']
+        if helpers.is_email(mobile):
+            mobile = helpers.md5_b16(mobile)
+
         code = data['code']
         context = models.SMSCode.CONTEXT_REGISTER
 
@@ -355,7 +389,7 @@ class UserRegisterSerializer(serializers.Serializer):
     password = serializers.CharField(
         max_length=64, error_messages={'required': u'密码不能为空'})
 
-    # 账号类型, 0-用户名, 1-邮箱, 2-手机号码
+    # 账号类型, 0-用户名, 1-邮箱, 2-手机号码, 3-微信openid
     typ = serializers.IntegerField(default=0)
 
     def validate_password(self, value):
@@ -406,9 +440,15 @@ class IsUserRegisteredSerializer(serializers.Serializer):
 
         :param value:
         """
-        if value not in ('username', 'mobile', 'email'):
+        if value not in ('username', 'mobile', 'email', 'weixin'):
             raise serializers.ValidationError(u'类型不符合要求')
         return value
+
+    def validate(self, data):
+        if data['type'] == 'mobile':
+            if not helpers.is_mobile(data['username']):
+                raise serializers.ValidationError({'username': u'手机号码不符合要求'})
+        return data
 
 
 class UserChangePasswordSerializer(serializers.Serializer):
@@ -440,7 +480,7 @@ class UserChangePasswordSerializer(serializers.Serializer):
 class UserForgetPasswordSerializer(serializers.Serializer):
     """用户忘记密码序列化器"""
     mobile = serializers.CharField(
-        max_length=16, error_messages={'required': u'手机不能为空'})
+        max_length=128, error_messages={'required': u'该字段不能为空'})
     code = serializers.CharField(
         max_length=16, error_messages={'required': u'验证码不能为空'})
     new_password = serializers.CharField(
@@ -451,11 +491,15 @@ class UserForgetPasswordSerializer(serializers.Serializer):
 
         :param value:
         """
-        from .helpers import is_mobile
-        if not is_mobile(value):
-            raise serializers.ValidationError(u'手机号码不符合要求')
-        if not models.User.check_mobile_existed(value):
-            raise serializers.ValidationError(u'手机号码未注册过')
+        from . import helpers
+
+        value = value.lower()
+
+        if not helpers.is_mobile(value) and not helpers.is_email(value):
+            raise serializers.ValidationError(u'该字段格式不符合要求')
+        if not models.User.check_mobile_existed(value) and \
+                not models.User.check_email_existed(value):
+            raise serializers.ValidationError(u'该账号未注册')
         return value
 
     def validate_new_password(self, value):
@@ -469,6 +513,9 @@ class UserForgetPasswordSerializer(serializers.Serializer):
 
     def validate(self, data):
         mobile = data['mobile']
+        if helpers.is_email(mobile):
+            mobile = helpers.md5_b16(mobile)
+
         code = data['code']
         context = models.SMSCode.CONTEXT_FORGET
 
@@ -476,3 +523,37 @@ class UserForgetPasswordSerializer(serializers.Serializer):
             return data
 
         raise serializers.ValidationError({'code': u'验证码错误'})
+
+
+class EmailResendConfirmationSerializer(serializers.Serializer):
+
+    email = serializers.EmailField(max_length=128, required=True, allow_blank=False)
+
+    def validate_email(self, value):
+        user = models.User.objects.filter(email=value).first()
+        if not user:
+            raise serializers.ValidationError(u'邮件地址未注册')
+        if user.email_confirmed:
+            raise serializers.ValidationError(u'邮件地址已确认')
+        return value
+
+
+class EmailResendConfirmSerializer(serializers.Serializer):
+
+    token = serializers.CharField(max_length=255, required=True, allow_blank=False)
+
+    def validate_token(self, value):
+        from urllib import parse
+        from django.core import signing
+
+        email_confirm_exp = getattr(settings, 'EMAIL_CONFIRM_EXPIRATION', None) or 3600
+
+        value = parse.unquote_plus(value)
+
+        try:
+            signing.loads(value, max_age=email_confirm_exp)
+            return value
+        except signing.SignatureExpired:
+            raise serializers.ValidationError(u'token 已过期')
+        except signing.BadSignature:
+            raise serializers.ValidationError(u'token 无效')

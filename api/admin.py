@@ -28,8 +28,15 @@ class UserAdmin(admin.ModelAdmin):
 
 
 class WeixinAppAdmin(admin.ModelAdmin):
-    list_display = ['id', 'appid', 'name']
+    list_display = ['id', 'sort', 'appid', 'name']
+    list_filter = ['sort']
     search_fields = ['appid', 'name']
+
+
+class WeixinAccountAdmin(admin.ModelAdmin):
+    list_display = ['id', 'sort', 'openid', 'unionid']
+    list_filter = ['sort']
+    search_fields = ['openid', 'unionid']
 
 
 class SMSCodeAdmin(admin.ModelAdmin):
@@ -47,4 +54,5 @@ class SMSCodeAdmin(admin.ModelAdmin):
 
 admin.site.register(models.User, UserAdmin)
 admin.site.register(models.WeixinApp, WeixinAppAdmin)
+admin.site.register(models.WeixinAccount, WeixinAccountAdmin)
 admin.site.register(models.SMSCode, SMSCodeAdmin)

@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 
+import json
 import datetime
 
 import pyotp
@@ -44,6 +45,12 @@ class User(models.Model):
     #: 昵称
     nickname = models.CharField(u'昵称', max_length=64, blank=True)
 
+    #: 姓名
+    fullname = models.CharField(u'姓名', max_length=64, blank=True)
+
+    #: 头像
+    avatar = models.CharField(u'头像', max_length=255, blank=True)
+
     #: 注册时间
     register_time = models.DateTimeField(u'注册时间', auto_now_add=True)
 
@@ -63,6 +70,10 @@ class User(models.Model):
 
     def __str__(self):
         return str(self.pk)
+
+    @property
+    def is_authenticated(self):
+        return True
 
     def check_password(self, password):
         """验证密码"""
@@ -110,12 +121,12 @@ class User(models.Model):
 
     @staticmethod
     def check_email_existed(email):
-        """检查用户名是否已存在
+        """检查邮箱是否已存在
 
         :param email: 电子邮箱
         """
 
-        user = User.objects.filter(email=email).first()
+        user = User.objects.filter(email__iexact=email).first()
         if user:
             return True
         return False
@@ -145,6 +156,9 @@ class UserWeixin(models.Model):
 
     #: Token
     token = models.CharField(u'Token', max_length=256, blank=True)
+
+    #: Refresh Token
+    refresh_token = models.CharField(u'Refresh Token', max_length=256, blank=True)
 
     #: 过期时间
     expires_time = models.DateTimeField(null=True, blank=True)
@@ -190,6 +204,14 @@ class UserWeixin(models.Model):
             return wx_user
         except UserWeixin.DoesNotExist:
             return None
+
+    @staticmethod
+    def is_exists(sort, weixin_id):
+        if sort == UserWeixin.SORT_OPENID:
+            _exists = UserWeixin.objects.filter(sort=sort, openid=weixin_id).exists()
+        else:
+            _exists = UserWeixin.objects.filter(sort=sort, unionid=weixin_id).exists()
+        return _exists
 
 
 class UserGoogle(models.Model):
@@ -252,6 +274,16 @@ class UserOTP(models.Model):
     def random_secret(length=32):
         return pyotp.random_base32(length=length)
 
+    def verify(self, code):
+        """验证
+
+        验证当前周期及前后各一个周期
+        """
+        _otp = pyotp.TOTP(self.secret)
+        is_valid = _otp.verify(code) or _otp.verify(code, valid_window=1) or \
+            _otp.verify(code, valid_window=-1)
+        return is_valid
+
     @staticmethod
     def get_user_otp(user):
         user_otp, created = UserOTP.objects.get_or_create(user=user)
@@ -262,24 +294,38 @@ class UserOTP(models.Model):
 
 
 class WeixinApp(models.Model):
-    """微信公众号"""
+    """微信应用程序"""
 
+    SORT_MOBILE = 'mobile'  # 移动应用
+    SORT_WEB = 'web'  # 网站应用
+    SORT_BIZ = 'biz'  # 公众号/小程序
+    SORTS = (
+        (SORT_BIZ, u'公众号/小程序'),
+        (SORT_WEB, u'网站应用'),
+        (SORT_MOBILE, u'移动应用'),
+    )
+
+    sort = models.CharField(max_length=16, default=SORT_BIZ, choices=SORTS)
     appid = models.CharField(max_length=64)
     appsecret = models.CharField(max_length=64, blank=True)
-    name = models.CharField(max_length=128, blank=True)  #: 公众号名称
+    name = models.CharField(max_length=128, blank=True)  #: 名称
     access_token = models.CharField(max_length=256, blank=True)
     jsapi_ticket = models.CharField(max_length=256, blank=True)
     expires_time = models.DateTimeField(null=True, blank=True)  #: 过期时间
 
     class Meta:
-        verbose_name = u'微信公众号'
-        verbose_name_plural = u'微信公众号'
+        verbose_name = u'微信应用程序'
+        verbose_name_plural = u'微信应用程序'
 
     def __str__(self):
         return str('%s[%s]' % (self.appid, self.name))
 
     def refresh_token(self):
         import requests
+
+        if self.sort != self.SORT_BIZ:
+            return
+
         token_url = 'https://api.weixin.qq.com/cgi-bin/token'
         ticket_url = 'https://api.weixin.qq.com/cgi-bin/ticket/getticket'
         token_payload = dict(
@@ -304,6 +350,54 @@ class WeixinApp(models.Model):
                         self.expires_time = datetime.datetime.now() + \
                             datetime.timedelta(seconds=ret['expires_in'] - 200)
                         self.save()
+
+
+class WeixinAccount(models.Model):
+    """微信应用用户账号"""
+
+    sort = models.CharField(max_length=16, default=WeixinApp.SORT_BIZ, choices=WeixinApp.SORTS)
+
+    #: 微信 OpenID
+    openid = models.CharField(u'OpenID', max_length=128, blank=True)
+
+    #: 微信 UnionID
+    unionid = models.CharField(u'UnionID', max_length=128, blank=True)
+
+    #: 访问令牌
+    access_token = models.CharField(max_length=256, blank=True)
+
+    #: 过期时间
+    expires_time = models.DateTimeField(null=True, blank=True)
+
+    #: 详情, 额外的信息, 使用 JSON 字符串保存
+    detail_raw = models.CharField(u'详情原始文本', max_length=512, blank=True)
+
+    class Meta:
+        verbose_name = u'微信应用用户账号'
+        verbose_name_plural = u'微信应用用户账号'
+
+    @property
+    def detail(self):
+        try:
+            return json.loads(self.detail_raw)
+        except json.JSONDecodeError:
+            return dict()
+
+    @detail.setter
+    def detail(self, value):
+        if not isinstance(value, dict):
+            raise ValueError('value not dict.')
+        self.detail_raw = json.dumps(value)
+
+    def get_userinfo(self):
+        from . import helpers
+
+        output = helpers.get_weixin_userinfo(self.openid)
+
+        self.detail = output
+        self.save(update_fields=['detail_raw'])
+
+        return output
 
 
 class SMSCode(models.Model):

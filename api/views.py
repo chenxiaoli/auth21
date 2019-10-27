@@ -10,16 +10,19 @@ import requests
 import pyotp
 
 from django.conf import settings
+from django.db import transaction
 
 from rest_framework import exceptions, status, viewsets
 from rest_framework import serializers as rest_serializers
 from rest_framework.decorators import (
+    list_route,
     api_view, authentication_classes, permission_classes)
 from rest_framework.response import Response
 
 from . import helpers
 from . import models
 from . import serializers
+from . import throttling
 from .authentication import BearerAuthentication
 from .permissions import IsUserAuthenticated
 
@@ -30,13 +33,8 @@ logger = logging.getLogger(__name__)
 def login(request):
     """用户登录"""
 
-    # 若未设置 ``JWT_SECRET``，则使用 ``SECRET_KEY``
-    jwt_secret = getattr(settings, 'JWT_SECRET', getattr(settings, 'SECRET_KEY'))
-    jwt_expiration = getattr(settings, 'JWT_EXPIRATION', 3600)
-
     serializer = serializers.UserLoginSerializer(data=request.data)
     if serializer.is_valid():
-        print(serializer.data)
         user = models.User.objects.get(pk=serializer.data['uid'])
         user.last_login_time = datetime.datetime.now()
         user.save(update_fields=['last_login_time'])
@@ -49,22 +47,23 @@ def login(request):
                     u'(id={0}, login_name={1}, ip={2})'
                     u''.format(*params))
 
-        now = int(time.time())
-        exp = now + jwt_expiration
+        token, jwt_expiration = helpers.make_user_token(user.pk)
 
-        payload = {'uid': user.pk, 'iat': now, 'exp': exp}
-        if user.mobile:
-            payload.update({"mobile":user.mobile})
-        if user.nickname:
-            payload.update({"nickname":user.nickname})
-        if user.email:
-            payload.update({"email":user.email})
+        res = Response({'token': token})
+        res.set_cookie('token', token, max_age=jwt_expiration - 120,
+                       httponly=settings.SESSION_COOKIE_HTTPONLY or None)
 
-        token = jwt.encode(payload, jwt_secret)
-
-        return Response({'token': token})
+        return res
 
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+@api_view(['GET', 'POST'])
+def logout(request):
+    """注销登录"""
+    res = Response()
+    res.delete_cookie('token')
+    return res
 
 
 @api_view(['GET'])
@@ -178,8 +177,9 @@ def weixin_web_auth(request):
 def weixin_authorize_url(request):
     """微信授权 URL"""
 
-    import hashlib
     from urllib import parse
+    from django.core.signing import TimestampSigner
+
     callback_url = getattr(settings, 'WEIXIN_REDIRECT_URI', None) or ''
     appid = getattr(settings, 'WEIXIN_APPID', None) or ''
 
@@ -192,9 +192,39 @@ def weixin_authorize_url(request):
         '#wechat_redirect'
     )
 
-    state = hashlib.sha1(str(time.time()).encode('utf-8')).hexdigest()
+    signer = TimestampSigner()
+    state = signer.sign('biz')
     callback_url = parse.quote_plus(callback_url)
-    _url = auth_url.format(appid, callback_url, 'snsapi_base', state)
+    scope = getattr(settings, 'WEIXIN_SCOPE', None) or 'snsapi_base'
+    _url = auth_url.format(appid, callback_url, scope, state)
+
+    return Response(dict(url=_url))
+
+
+@api_view()
+def weixin_qrconnect_url(request):
+    """微信扫码登录 URL"""
+
+    from urllib import parse
+    from django.core.signing import TimestampSigner
+
+    callback_url = getattr(settings, 'WEIXIN_WEB_REDIRECT_URI', None) or ''
+    appid = getattr(settings, 'WEIXIN_WEB_APPID', None) or ''
+
+    auth_url = (
+        'https://open.weixin.qq.com/connect/qrconnect?'
+        'appid={0}'
+        '&redirect_uri={1}'
+        '&response_type=code&scope={2}'
+        '&state={3}'
+        '#wechat_redirect'
+    )
+
+    signer = TimestampSigner()
+    state = signer.sign('web')
+    callback_url = parse.quote_plus(callback_url)
+    scope = 'snsapi_login'
+    _url = auth_url.format(appid, callback_url, scope, state)
 
     return Response(dict(url=_url))
 
@@ -203,9 +233,23 @@ def weixin_authorize_url(request):
 def weixin_access_token(request):
     """通过 code 获取 access_token"""
 
+    from urllib import parse
+    from django.core.signing import TimestampSigner, SignatureExpired, BadSignature
+
     appid = getattr(settings, 'WEIXIN_APPID', '')
-    weixin = models.WeixinApp.objects.get(appid=appid)
     code = request.data.get('code') or ''
+    state = parse.unquote_plus(request.data.get('state') or '')
+
+    signer = TimestampSigner()
+    try:
+        # 5 分钟有效, 因为 code 也是这个有效期
+        state = signer.unsign(state, max_age=5 * 60)
+        if state == 'web':
+            appid = getattr(settings, 'WEIXIN_WEB_APPID', '')
+    except (SignatureExpired, BadSignature):
+        return Response(dict(state=['state 无效']), status=status.HTTP_400_BAD_REQUEST)
+
+    weixin = models.WeixinApp.objects.get(appid=appid)
     url = 'https://api.weixin.qq.com/sns/oauth2/access_token'
 
     payload = {
@@ -225,12 +269,24 @@ def weixin_access_token(request):
             if 'errcode' in _json:
                 return Response(dict(code=[_json.get('errmsg')]), status=status.HTTP_400_BAD_REQUEST)
 
+            if 'unionid' in _json:
+                wx_account, _ = models.WeixinAccount.objects.get_or_create(
+                    sort=state, unionid=_json.get('unionid'))
+            else:
+                wx_account, _ = models.WeixinAccount.objects.get_or_create(
+                    sort=state, openid=_json.get('openid'))
+
             output['sort'] = weixin_id_sort
 
             if 'openid' in _json:
                 output['openid'] = _json.get('openid')
+                wx_account.openid = _json.get('openid')
             if 'unionid' in _json:
                 output['unionid'] = _json.get('unionid')
+                wx_account.unionid = _json.get('unionid')
+
+            wx_account.access_token = _json.get('access_token')
+            wx_account.save(update_fields=['openid', 'unionid', 'access_token'])
 
             # 判断当前微信是否绑定
             if weixin_id_sort == models.UserWeixin.SORT_OPENID:
@@ -239,13 +295,32 @@ def weixin_access_token(request):
                 wx_user = models.UserWeixin.get_instance(weixin_id_sort, _json.get('unionid'))
             output['is_registered'] = wx_user is not None
 
+            jwt_expiration = None
             if wx_user:
+                _token, jwt_expiration = helpers.make_user_token(wx_user.user.id, expiration=7 * 24 * 3600)
+                output['token'] = _token
+
+                if state == 'biz' and not wx_user.openid and output['openid']:
+                    wx_user.openid = output['openid']
+
                 wx_user.token = _json.get('access_token')
+                wx_user.refresh_token = _json.get('refresh_token')
                 wx_user.expires_time = datetime.datetime.now() + \
                     datetime.timedelta(seconds=_json.get('expires_in', 7200) - 200)
-                wx_user.save(update_fields=['token'])
+                wx_user.save(update_fields=['openid', 'token', 'refresh_token', 'expires_time'])
 
-            return Response(output)
+                if state == 'biz':
+                    try:
+                        helpers.feedback_profile(wx_user.user.id)
+                    except:
+                        pass
+
+            res = Response(output)
+            if jwt_expiration and 'token' in output:
+                res.set_cookie('token', output['token'], max_age=jwt_expiration - 120,
+                               httponly=settings.SESSION_COOKIE_HTTPONLY or None)
+
+            return res
 
         except json.JSONDecodeError:
             pass
@@ -263,32 +338,49 @@ def weixin_bind(request):
     serializer = serializers.UserBindWeixinSerializer(data=request.data)
     if serializer.is_valid():
 
+        sort = models.UserWeixin.get_weixin_id_sort()
         if not hasattr(user, 'weixin'):
-            sort = models.UserWeixin.get_weixin_id_sort()
             models.UserWeixin.objects.update_or_create(user=user, defaults=dict(sort=sort))
 
         if user.weixin.weixin_id != '' and len(user.weixin.weixin_id) >= 20:
             return Response(dict(weixin_id=[u'当前用户已绑定微信 OpenID。']),
                             status=status.HTTP_400_BAD_REQUEST)
 
-        user.weixin.weixin_id = serializer.data['weixin_id']
-        user.weixin.save(update_fields=['openid', 'unionid'])
+        weixin_id = serializer.data['weixin_id']
 
-        return Response(dict(uid=user.id))
+        # 针对微信公众号, 要把 openid 传到业务服务器
+        sort_biz = models.WeixinApp.SORT_BIZ
+        if sort == models.UserWeixin.SORT_UNIONID:
+            wx_account = models.WeixinAccount.objects.filter(
+                sort=sort_biz, unionid=weixin_id).first()
+        else:
+            wx_account = models.WeixinAccount.objects.filter(
+                sort=sort_biz, openid=weixin_id).first()
+
+        with transaction.atomic():
+            user.weixin.weixin_id = serializer.data['weixin_id']
+
+            if wx_account:
+                user.weixin.openid = wx_account.openid
+
+            user.weixin.save(update_fields=['openid', 'unionid'])
+
+            if wx_account:
+                helpers.feedback_profile(user.id)
+
+            return Response(dict(uid=user.id))
 
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
 @api_view(['POST'])
-@authentication_classes([BearerAuthentication])
-@permission_classes([IsUserAuthenticated])
 def weixin_config(request):
     """微信 JSSDK 配置"""
     serializer = serializers.WeixinConfigSerializer(data=request.data)
     if serializer.is_valid():
         appid = getattr(settings, 'WEIXIN_APPID', '')
         is_debug = getattr(settings, 'WEIXIN_JSSDK_DEBUG', False)
-        weixin = models.WeixinApp.objects.get(appid=appid)
+        weixin = models.WeixinApp.objects.get(sort=models.WeixinApp.SORT_BIZ, appid=appid)
         url = serializer.data['url']
         print(url)
         sign = helpers.WeixinWebSign(weixin.jsapi_ticket, url)
@@ -308,11 +400,20 @@ def weixin_config(request):
 def send_sms_code(request):
     """发送短信验证码"""
     from django.utils import timezone
+    from django.core.mail import EmailMultiAlternatives
+    from django.template import engines
+
     serializer = serializers.SendSMSCodeSerializer(data=request.data)
     if serializer.is_valid():
-        mobile = serializer.data['mobile']
+        _is_email = False
+
+        mobile = _email = serializer.data['mobile']
         context = serializer.data['context']
         remote_ip = helpers.get_identify(request)
+
+        if helpers.is_email(mobile):
+            _is_email = True
+            mobile = helpers.md5_b16(mobile)
 
         # 限制单个 IP 的请求频率
         _rate = getattr(settings, 'SMS_SEND_RATE', (300, 5))
@@ -327,7 +428,7 @@ def send_sms_code(request):
 
         old_sms_code = models.SMSCode.objects.filter(mobile=mobile, context=context).first()
         if old_sms_code and not old_sms_code.can_resend():
-            return Response(dict(detail=u'该号码发送频率超过限制，请稍后再试。'),
+            return Response(dict(detail=u'发送频率超过限制，请稍后再试。'),
                             status=status.HTTP_429_TOO_MANY_REQUESTS)
 
         code = models.SMSCode.gen_code(6)
@@ -342,6 +443,30 @@ def send_sms_code(request):
         result = False
 
         _params = {'code': code}
+
+        # 发送邮件验证码
+        if _is_email:
+            django_engine = engines['django']
+            contexts = dict(models.SMSCode.CONTEXTS)
+            _params['context'] = contexts.get(context) or ''
+
+            sign = template.get('sign') or sms_sign
+            subject = '{0} - {1}'.format(sign, '验证码')
+            email_host_user = getattr(settings, 'EMAIL_HOST_USER', None) or 'no-reply@example.com'
+            from_email = '{0} <{1}>'.format(sign, email_host_user)
+            to = _email
+
+            tpl_string = template.get('email_template') or '验证码: {{ code }}'
+            tpl = django_engine.from_string(tpl_string)
+            text_content = tpl.render(_params)
+            html_content = text_content
+            msg = EmailMultiAlternatives(subject, text_content, from_email, [to])
+            msg.attach_alternative(html_content, 'text/html')
+            count = msg.send(fail_silently=True)
+
+            send = count == 1
+            return Response(dict(send=send, type='email'))
+
         _params.update(template.get('template_params', {}))
         headers = {
             'Authorization': 'Bearer {0}'.format(getattr(settings, 'SMS_SERVICE_AUTH_TOKEN', '')),
@@ -362,7 +487,7 @@ def send_sms_code(request):
             try:
                 _json = res.json()
                 result = _json.get('sent', False)
-                return Response(dict(sent=result))
+                return Response(dict(sent=result, type='sms'))
             except json.JSONDecodeError:
                 pass
         except requests.exceptions.ConnectionError:
@@ -379,6 +504,8 @@ def check_sms_code(request):
 
     if serializer.is_valid():
         mobile = serializer.data['mobile']
+        if helpers.is_email(mobile):
+            mobile = helpers.md5_b16(mobile)
         code = serializer.data['code']
         context = serializer.data['context']
         result = models.SMSCode.check_code(mobile, code, context)
@@ -392,11 +519,29 @@ def register_by_mobile(request):
     """用户通过手机注册"""
     serializer = serializers.UserRegisterByMobileSerializer(data=request.data)
     if serializer.is_valid():
-        user = models.User(mobile=serializer.data['mobile'], password=serializer.data['password'])
+        payload = dict()
+        mobile = serializer.data['mobile']
+        password = serializer.data['password']
+        nickname= serializer.data['nickname']
+
+        payload['nickname'] =nickname
+        if helpers.is_email(mobile):
+            user = models.User(email=mobile, password=password)
+            user.email_confirmed = True
+            payload['mobile'] = ''
+            payload['email'] = mobile
+        else:
+            user = models.User(mobile=mobile, password=password)
+            payload['mobile'] = mobile
+            payload['email'] = ''
+        user.nickname=nickname
         user.account_state = models.User.ACCOUNT_STATE_ACTIVATED
         user.save()
 
-        return Response({'mobile': serializer.data['mobile'], 'uid': user.id})
+        payload['uid'] = user.id
+
+
+        return Response(payload)
 
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
@@ -408,21 +553,42 @@ def register(request):
     if serializer.is_valid():
         data = serializer.data
 
+        username = data['username']
+        password = data['password']
+
         if data['typ'] == 1:
             # 邮箱注册
-            kwargs = dict(email=data['username'], password=data['password'])
+            kwargs = dict(email=username, password=password)
         elif data['typ'] == 2:
             # 手机号码注册
-            kwargs = dict(mobile=data['username'], password=data['password'])
+            kwargs = dict(mobile=username, password=password)
         else:
             # 用户名注册
-            kwargs = dict(username=data['username'], password=data['password'])
+            kwargs = dict(username=username, password=password)
 
         user = models.User(**kwargs)
         user.account_state = models.User.ACCOUNT_STATE_ACTIVATED
         user.save()
 
-        return Response({'uid': user.id})
+        output = dict(uid=user.id)
+        if data['typ'] == 3:
+            # 通过微信 openid 注册, 则同时绑定微信信息
+            user.password_hash = ''
+            user.save(update_fields=['password_hash'])
+            sort = models.UserWeixin.get_weixin_id_sort()
+            info = helpers.get_weixin_userinfo(username)
+            if 'openid' in info:
+                defaults = dict(openid=info.get('openid'))
+                if sort == models.UserWeixin.SORT_OPENID:
+                    models.UserWeixin.objects.update_or_create(user=user, sort=sort, defaults=defaults)
+                else:
+                    unionid = info.get('unionid')
+                    if unionid:
+                        defaults['unionid'] = unionid
+                    models.UserWeixin.objects.update_or_create(user=user, sort=sort, defaults=defaults)
+                output['weixin'] = info
+
+        return Response(output)
 
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
@@ -444,6 +610,14 @@ def is_user_registered(request):
         elif type == 'email':
             if models.User.check_email_existed(username):
                 is_user_existed = True
+        elif type == 'weixin':
+            sort = models.UserWeixin.get_weixin_id_sort()
+            info = helpers.get_weixin_userinfo(username)
+            if 'openid' in info:
+                if sort == models.UserWeixin.SORT_OPENID:
+                    is_user_existed = models.UserWeixin.is_exists(sort, info.get('openid'))
+                else:
+                    is_user_existed = models.UserWeixin.is_exists(sort, info.get('unionid'))
         return Response({'is_user_registered': is_user_existed})
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
@@ -470,7 +644,10 @@ def forget_password(request):
     serializer = serializers.UserForgetPasswordSerializer(data=request.data)
     if serializer.is_valid():
         mobile = serializer.data['mobile']
-        user = models.User.objects.get(mobile=mobile)
+        if helpers.is_email(mobile):
+            user = models.User.objects.get(email=mobile)
+        else:
+            user = models.User.objects.get(mobile=mobile)
         user.password = serializer.data['new_password']
         user.save(update_fields=['password_hash'])
         return Response(dict(uid=user.id))
@@ -483,10 +660,6 @@ def forget_password(request):
 def check_2fa_password(request):
     """检查两步认证密码"""
 
-    # 若未设置 ``JWT_SECRET``，则使用 ``SECRET_KEY``
-    jwt_secret = getattr(settings, 'JWT_SECRET', getattr(settings, 'SECRET_KEY'))
-
-    jwt_expiration = getattr(settings, 'JWT_EXPIRATION', 60 * 60)
     jwt_expiration_2fa = getattr(settings, 'JWT_EXPIRATION_2FA', 5 * 60)
 
     context = dict(request=request)
@@ -494,17 +667,19 @@ def check_2fa_password(request):
         data=request.data, context=context)
 
     if serializer.is_valid():
-        print(serializer.data)
         user = models.User.objects.get(pk=serializer.data['uid'])
 
         now = int(time.time())
-        exp = now + jwt_expiration
         exp_2fa = now + jwt_expiration_2fa
 
-        payload = {'uid': user.pk, 'iat': now, 'exp': exp, 'exp_2fa': exp_2fa}
-        token = jwt.encode(payload, jwt_secret)
+        params = {'exp_2fa': exp_2fa}
+        token, jwt_expiration = helpers.make_user_token(user.pk, params=params)
 
-        return Response({'token': token})
+        res = Response({'token': token})
+        res.set_cookie('token', token, max_age=jwt_expiration - 120,
+                       httponly=settings.SESSION_COOKIE_HTTPONLY or None)
+
+        return res
 
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
@@ -591,4 +766,196 @@ def otp_close(request):
         user_otp.delete()
         return Response({})
 
+    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+class UserViewSet(viewsets.ViewSet):
+
+    throttle_scope = None
+    throttle_actions = [
+        'resend_confirmation_email', 'confirm_email',
+    ]
+
+    def get_throttles(self):
+        if self.action in self.throttle_actions:
+            self.throttle_scope = 'user.' + self.action
+        return super().get_throttles()
+
+    @list_route(methods=['POST'], url_path='resend-confirmation-email')
+    def resend_confirmation_email(self, request):
+        """重发确认邮件"""
+
+        from django.core import signing
+
+        serializer = serializers.EmailResendConfirmationSerializer(data=request.data)
+
+        if serializer.is_valid():
+            to = serializer.data['email']
+
+            sitename = getattr(settings, 'SMS_SIGN', None) or \
+                getattr(settings, 'OTP_ISSUER_NAME', None) or 'Auth21'
+            email_confirm_exp = getattr(settings, 'EMAIL_CONFIRM_EXPIRATION', None) or 3600
+            email_confirm_url = getattr(settings, 'EMAIL_CONFIRM_URL', None) or '/'
+
+            token = signing.dumps({"email": to})
+            link = helpers.update_url_params(email_confirm_url, dict(token=token))
+
+            context = dict(
+                hour=int(email_confirm_exp / 3600),
+                link=link,
+                sitename=sitename,
+            )
+
+            send = helpers.send_email(to, '注册邮箱确认', 'api/email/confirm', context=context)
+
+            return Response(dict(send=send))
+
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    @list_route(methods=['POST'], url_path='confirm-email')
+    def confirm_email(self, request):
+        """邮件确认"""
+
+        from django.core import signing
+
+        serializer = serializers.EmailResendConfirmSerializer(data=request.data)
+        if serializer.is_valid():
+            token = signing.loads(serializer.data['token'])
+
+            user = models.User.objects.get(email=token['email'])
+            if not user.email_confirmed:
+                user.email_confirmed = True
+                user.save(update_fields=['email_confirmed'])
+
+            return Response(dict(confirmed=True))
+
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+class WeixinViewSet(viewsets.ViewSet):
+    """微信公众号接口"""
+
+    @list_route(methods=['POST'], url_path='send-custom-message')
+    def send_custom_message(self, request):
+        """发送客服消息"""
+        appid = getattr(settings, 'WEIXIN_APPID', '')
+        wx = models.WeixinApp.objects.get(appid=appid)
+
+        _url = 'https://api.weixin.qq.com/cgi-bin/message/custom/send?access_token={0}'
+        url = _url.format(wx.access_token)
+
+        data = request.data.copy()
+
+        parent_uid = data.pop('parent_uid', None)
+        try:
+            parent_user = models.User.objects.get(id=parent_uid)
+            data['touser'] = parent_user.weixin.openid
+        except models.User.DoesNotExist:
+            pass
+
+        try:
+            assert 'touser' in data
+
+            # 不转成 UTF-8 的话, 在会话窗口显示 Unicode 编码
+            raw = (json.dumps(data, ensure_ascii=False)).encode()
+
+            res = requests.post(url, data=raw)
+            if res.status_code == status.HTTP_200_OK:
+                _json = res.json()
+                if _json.get('errcode') == 0:
+                    return Response(_json)
+                else:
+                    return Response(_json, status=status.HTTP_400_BAD_REQUEST)
+        except (requests.exceptions.ConnectionError, AssertionError):
+            return Response(status=status.HTTP_502_BAD_GATEWAY)
+
+    @list_route(methods=['POST'], url_path='send-template-message')
+    def send_template_message(self, request):
+        """发送模板消息"""
+        appid = getattr(settings, 'WEIXIN_APPID', '')
+        wx = models.WeixinApp.objects.get(appid=appid)
+
+        _url = 'https://api.weixin.qq.com/cgi-bin/message/template/send?access_token={0}'
+        url = _url.format(wx.access_token)
+
+        data = request.data.copy()
+
+        parent_uid = data.pop('parent_uid', None)
+        try:
+            parent_user = models.User.objects.get(id=parent_uid)
+            data['touser'] = parent_user.weixin.openid
+        except models.User.DoesNotExist:
+            pass
+
+        try:
+            assert 'touser' in data
+
+            res = requests.post(url, json=data)
+            if res.status_code == status.HTTP_200_OK:
+                _json = res.json()
+                if _json.get('errcode') == 0:
+                    return Response(_json)
+                else:
+                    return Response(_json, status=status.HTTP_400_BAD_REQUEST)
+        except (requests.exceptions.ConnectionError, AssertionError):
+            return Response(status=status.HTTP_502_BAD_GATEWAY)
+
+    @list_route(methods=['POST'], url_path='create-qrcode')
+    def create_qrcode(self, request):
+        """创建推广二维码"""
+        appid = getattr(settings, 'WEIXIN_APPID', '')
+        wx = models.WeixinApp.objects.get(appid=appid)
+
+        _url = 'https://api.weixin.qq.com/cgi-bin/qrcode/create?access_token={0}'
+        url = _url.format(wx.access_token)
+
+        data = request.data.copy()
+
+        try:
+            # 不转成 UTF-8 的话, 在会话窗口显示 Unicode 编码
+            raw = (json.dumps(data, ensure_ascii=False)).encode()
+
+            res = requests.post(url, data=raw)
+            if res.status_code == status.HTTP_200_OK:
+                _json = res.json()
+                if 'ticket' in _json:
+                    return Response(_json)
+                else:
+                    return Response(_json, status=status.HTTP_400_BAD_REQUEST)
+        except requests.exceptions.ConnectionError:
+            return Response(status=status.HTTP_502_BAD_GATEWAY)
+
+    @list_route(methods=['POST'], url_path='upload-media')
+    def upload_media(self, request):
+        """上传多媒体文件"""
+        appid = getattr(settings, 'WEIXIN_APPID', '')
+        wx = models.WeixinApp.objects.get(appid=appid)
+
+        data = request.data.copy()
+        media_type = data.get('type', 'image')
+
+        _url = 'https://api.weixin.qq.com/cgi-bin/media/upload?access_token={0}&type={1}'
+        url = _url.format(wx.access_token, media_type)
+
+        try:
+            res = requests.post(url, files=dict(media=data.get('media')))
+            if res.status_code == status.HTTP_200_OK:
+                _json = res.json()
+                if 'media_id' in _json:
+                    return Response(_json)
+                else:
+                    return Response(_json, status=status.HTTP_400_BAD_REQUEST)
+        except requests.exceptions.ConnectionError:
+            return Response(status=status.HTTP_502_BAD_GATEWAY)
+
+
+@api_view(['PUT'])
+@authentication_classes([BearerAuthentication])
+@permission_classes([IsUserAuthenticated])
+def edit_user_info(request):
+    user = request.user
+    serializer = serializers.UserInfoSerializer(user,data=request.data)
+    if serializer.is_valid():
+        serializer.save()
+        return Response(serializer.data)
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)

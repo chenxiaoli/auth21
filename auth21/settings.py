@@ -23,6 +23,7 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SECRET_KEY = os.getenv(
     'SECRET_KEY', '(f3&4mv)cau_+!=3q2jp$#ap#-@j!(rbevulc!2345e*--4pu1')
 
+
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
@@ -128,9 +129,24 @@ USE_TZ = False
 STATIC_URL = '/static/'
 
 CORS_ORIGIN_ALLOW_ALL = True
+CORS_ALLOW_CREDENTIALS = True
+from corsheaders.defaults import default_headers
 
+CORS_ALLOW_HEADERS = default_headers + (
+    'X-Auth-Token',
+    'Project',
+    'Team',
+    'Jwt-Auth-Token',
+
+)
 REST_FRAMEWORK = {
     'DEFAULT_VERSIONING_CLASS': 'rest_framework.versioning.NamespaceVersioning',
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.LimitOffsetPagination',
     'PAGE_SIZE': 20,
+    'DEFAULT_THROTTLE_CLASSES': (
+        'rest_framework.throttling.ScopedRateThrottle',
+    ),
+    'DEFAULT_THROTTLE_RATES': {
+        'user.resend_confirmation_email': '10/hour',
+    }
 }
