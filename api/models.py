@@ -487,6 +487,56 @@ class SMSCode(models.Model):
         return False
 
 
+
+class UserTreeManager(models.Model):
+    def add_node(self,user):
+        parent=self.get_parent()
+        if parent:
+            parent.add_node(user)
+        else: # tree is null
+            user_tree=UserTree(user=user,level=0)
+            user_tree.save()
+
+    def get_user_tree(self,user):
+        node=self.get(user=user)
+        return node.get_children()
+
+    def get_parent(self):
+        last = self.all().order_by("id").last()
+        parent=None
+        if last:
+            parent = last.parent
+            if not parent:# last one is root node
+                return last
+            if parent.is_full:  # child
+                not_full_brother=parent.get_not_full_brother()
+                if not_full_brother:
+                    parent=not_full_brother
+                else:   #
+                    parent=self.filter(level=last.level).order_by("id").first()
+        return parent
+
+class UserTree(models.Model):
+    parent = models.ForeignKey('self')
+    user=models.ForeignKey(User,unique=True,related_name="tree_user")
+    is_full=models.BooleanField(default=False)
+    level=models.IntegerField(default=0)
+    def get_children(self):
+        return UserTree.objects.filter(parent=self).order_by("id")
+    def count_children(self):
+        return UserTree.objects.filter(parent=self).count()
+    def get_not_full_brother(self):
+        uncle=UserTree.objects.filter(level=self.level,is_full=False).order_by("id").first()
+        return uncle
+
+    def add_node(self,user):
+        user_tree=UserTree(parent=self,user=user,level=self.level+1)
+        user_tree.save()
+        if self.count_children()==3:
+            self.is_full=True
+            self.save()
+        return user_tree
+
 def user_post_save(sender, instance, created, **kwargs):
     from django.conf import settings
     if created:
@@ -497,6 +547,8 @@ def user_post_save(sender, instance, created, **kwargs):
 
         UserWeixin.objects.update_or_create(user=instance, defaults=dict(sort=weixin_id_sort))
         UserGoogle.objects.update_or_create(user=instance)
+
+
 
 
 models.signals.post_save.connect(user_post_save, sender=User)
